@@ -1,8 +1,8 @@
 /* -----------------------------------------------------------------------
-   darwin.S - Copyright (c) 1996, 1998, 2001, 2002, 2003, 2005  Red Hat, Inc.
-	Copyright (C) 2008  Free Software Foundation, Inc.
+   darwin.S - Copyright (c) 2000 John Hornkvist
+	      Copyright (c) 2004, 2010 Free Software Foundation, Inc.
 
-   X86 Foreign Function Interface
+   PowerPC Assembly glue.
 
    Permission is hereby granted, free of charge, to any person obtaining
    a copy of this software and associated documentation files (the
@@ -15,430 +15,364 @@
    The above copyright notice and this permission notice shall be included
    in all copies or substantial portions of the Software.
 
-   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND,
-   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-   NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
-   HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-   WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-   DEALINGS IN THE SOFTWARE.
-   -----------------------------------------------------------------------
-   */
+   THE SOFTWARE IS PROVIDED ``AS IS'', WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+   OTHER DEALINGS IN THE SOFTWARE.
+   ----------------------------------------------------------------------- */
 
-#ifndef __x86_64__
+#define LIBFFI_ASM
+#if defined(__ppc64__)
+#define MODE_CHOICE(x, y) y
+#else
+#define MODE_CHOICE(x, y) x
+#endif
 
-#define LIBFFI_ASM	
+#define machine_choice	MODE_CHOICE(ppc7400,ppc64)
+
+; Define some pseudo-opcodes for size-independent load & store of GPRs ...
+#define lgu		MODE_CHOICE(lwzu, ldu)
+#define lg		MODE_CHOICE(lwz,ld)
+#define sg		MODE_CHOICE(stw,std)
+#define sgu		MODE_CHOICE(stwu,stdu)
+#define sgux		MODE_CHOICE(stwux,stdux)
+
+; ... and the size of GPRs and their storage indicator.
+#define GPR_BYTES	MODE_CHOICE(4,8)
+#define LOG2_GPR_BYTES	MODE_CHOICE(2,3)	/* log2(GPR_BYTES) */
+#define g_long		MODE_CHOICE(long, quad)	/* usage is ".g_long" */
+
+; From the ABI doc: "Mac OS X ABI Function Call Guide" Version 2009-02-04.
+#define LINKAGE_SIZE	MODE_CHOICE(24,48)
+#define PARAM_AREA	MODE_CHOICE(32,64)
+#define SAVED_LR_OFFSET	MODE_CHOICE(8,16)	/* save position for lr */
+
+/* If there is any FP stuff we make space for all of the regs.  */
+#define SAVED_FPR_COUNT 13
+#define FPR_SIZE	8
+#define RESULT_BYTES	16
+
+/* This should be kept in step with the same value in ffi_darwin.c.  */
+#define ASM_NEEDS_REGISTERS 4
+#define SAVE_REGS_SIZE (ASM_NEEDS_REGISTERS * GPR_BYTES)
+
 #include <fficonfig.h>
 #include <ffi.h>
 
-.text
+#define JUMPTARGET(name) name
+#define L(x) x
 
-.globl _ffi_prep_args
+	.text
+	.align 2
+	.globl _ffi_prep_args
 
-	.align 4
-.globl _ffi_call_SYSV
+	.align 2
+	.globl _ffi_call_DARWIN
 
-_ffi_call_SYSV:
-.LFB1:
-        pushl %ebp
-.LCFI0:
-        movl  %esp,%ebp
-.LCFI1:
-        subl $8,%esp
-	/* Make room for all of the new args.  */
-	movl  16(%ebp),%ecx
-	subl  %ecx,%esp
+	/* We arrive here with:
+	   r3 = ptr to extended cif.
+	   r4 = -bytes.
+	   r5 = cif flags.
+	   r6 = ptr to return value.
+	   r7 = fn pointer (user func).
+	   r8 = fn pointer (ffi_prep_args).
+	   r9 = ffi_type* for the ret val.  */
 
-	movl  %esp,%eax
+_ffi_call_DARWIN:
+Lstartcode:
+	mr   	r12,r8	/* We only need r12 until the call,
+			   so it does not have to be saved.  */
+LFB1:
+	/* Save the old stack pointer as AP.  */
+	mr	r8,r1
+LCFI0:
+	
+	/* Save the retval type in parents frame.  */
+	sg	r9,(LINKAGE_SIZE+6*GPR_BYTES)(r8)
 
-	/* Place all of the ffi_prep_args in position  */
-	subl  $8,%esp
-	pushl 12(%ebp)
-	pushl %eax
-	call  *8(%ebp)
+	/* Allocate the stack space we need.  */
+	sgux	r1,r1,r4
 
-	/* Return stack to previous state and call the function  */
-	addl  $16,%esp	
+	/* Save registers we use.  */
+	mflr	r9
+	sg	r9,SAVED_LR_OFFSET(r8)
 
-	call  *28(%ebp)
+	sg	r28,-(4 * GPR_BYTES)(r8)	
+	sg	r29,-(3 * GPR_BYTES)(r8)
+	sg	r30,-(2 * GPR_BYTES)(r8)
+	sg	r31,-(    GPR_BYTES)(r8)
 
-	/* Load %ecx with the return type code  */
-	movl  20(%ebp),%ecx	
-
-	/* Protect %esi.  We're going to pop it in the epilogue.  */
-	pushl %esi
-
-	/* If the return value pointer is NULL, assume no return value.  */
-	cmpl  $0,24(%ebp)
-	jne  0f
-
-	/* Even if there is no space for the return value, we are 
-	   obliged to handle floating-point values.  */
-	cmpl  $FFI_TYPE_FLOAT,%ecx
-	jne   noretval
-	fstp  %st(0)
-
-	jmp   epilogue
-0:
-	.align 4
-	call 1f
-.Lstore_table:
-	.long   noretval-.Lstore_table		/* FFI_TYPE_VOID */
-	.long   retint-.Lstore_table		/* FFI_TYPE_INT */
-	.long   retfloat-.Lstore_table		/* FFI_TYPE_FLOAT */
-	.long   retdouble-.Lstore_table		/* FFI_TYPE_DOUBLE */
-	.long   retlongdouble-.Lstore_table     /* FFI_TYPE_LONGDOUBLE */
-	.long   retuint8-.Lstore_table		/* FFI_TYPE_UINT8 */
-	.long   retsint8-.Lstore_table		/* FFI_TYPE_SINT8 */
-	.long   retuint16-.Lstore_table		/* FFI_TYPE_UINT16 */
-	.long   retsint16-.Lstore_table		/* FFI_TYPE_SINT16 */
-	.long   retint-.Lstore_table		/* FFI_TYPE_UINT32 */
-	.long   retint-.Lstore_table		/* FFI_TYPE_SINT32 */
-	.long   retint64-.Lstore_table		/* FFI_TYPE_UINT64 */
-	.long   retint64-.Lstore_table		/* FFI_TYPE_SINT64 */
-	.long   retstruct-.Lstore_table		/* FFI_TYPE_STRUCT */
-	.long   retint-.Lstore_table		/* FFI_TYPE_POINTER */
-	.long   retstruct1b-.Lstore_table	/* FFI_TYPE_SMALL_STRUCT_1B */
-	.long   retstruct2b-.Lstore_table	/* FFI_TYPE_SMALL_STRUCT_2B */
-1:
-	pop  %esi
-	add  (%esi, %ecx, 4), %esi
-	jmp  *%esi
-
-	/* Sign/zero extend as appropriate.  */
-retsint8:
-	movsbl  %al, %eax
-	jmp  retint
-
-retsint16:
-	movswl  %ax, %eax
-	jmp  retint
-
-retuint8:
-	movzbl  %al, %eax
-	jmp  retint
-
-retuint16:
-	movzwl  %ax, %eax
-	jmp  retint
-
-retfloat:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	fstps (%ecx)
-	jmp   epilogue
-
-retdouble:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	fstpl (%ecx)
-	jmp   epilogue
-
-retlongdouble:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	fstpt (%ecx)
-	jmp   epilogue
-
-retint64:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	movl  %eax,0(%ecx)
-	movl  %edx,4(%ecx)
-	jmp   epilogue
-
-retstruct1b:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	movb  %al,0(%ecx)
-	jmp   epilogue
-
-retstruct2b:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	movw  %ax,0(%ecx)
-	jmp   epilogue
-
-retint:
-	/* Load %ecx with the pointer to storage for the return value  */
-	movl  24(%ebp),%ecx
-	movl  %eax,0(%ecx)
-
-retstruct:
-	/* Nothing to do!  */
-
-noretval:
-epilogue:
-	popl %esi
-	movl %ebp,%esp
-	popl %ebp
-	ret
-
-.LFE1:
-.ffi_call_SYSV_end:
-
-	.align	4
-FFI_HIDDEN (ffi_closure_SYSV)
-.globl _ffi_closure_SYSV
-
-_ffi_closure_SYSV:
-.LFB2:
-	pushl	%ebp
-.LCFI2:
-	movl	%esp, %ebp
-.LCFI3:
-	subl	$40, %esp
-	leal	-24(%ebp), %edx
-	movl	%edx, -12(%ebp)	/* resp */
-	leal	8(%ebp), %edx
-	movl	%edx, 4(%esp)	/* args = __builtin_dwarf_cfa () */
-	leal	-12(%ebp), %edx
-	movl	%edx, (%esp)	/* &resp */
-	movl	%ebx, 8(%esp)
-.LCFI7:
-	call	L_ffi_closure_SYSV_inner$stub
-	movl	8(%esp), %ebx
-	movl	-12(%ebp), %ecx
-	cmpl	$FFI_TYPE_INT, %eax
-	je	.Lcls_retint
-
-	/* Handle FFI_TYPE_UINT8, FFI_TYPE_SINT8, FFI_TYPE_UINT16,
-	   FFI_TYPE_SINT16, FFI_TYPE_UINT32, FFI_TYPE_SINT32.  */
-	cmpl	$FFI_TYPE_UINT64, %eax
-	jge	0f
-	cmpl	$FFI_TYPE_UINT8, %eax
-	jge	.Lcls_retint
-
-0:	cmpl	$FFI_TYPE_FLOAT, %eax
-	je	.Lcls_retfloat
-	cmpl	$FFI_TYPE_DOUBLE, %eax
-	je	.Lcls_retdouble
-	cmpl	$FFI_TYPE_LONGDOUBLE, %eax
-	je	.Lcls_retldouble
-	cmpl	$FFI_TYPE_SINT64, %eax
-	je	.Lcls_retllong
-	cmpl	$FFI_TYPE_SMALL_STRUCT_1B, %eax
-	je	.Lcls_retstruct1b
-	cmpl	$FFI_TYPE_SMALL_STRUCT_2B, %eax
-	je	.Lcls_retstruct2b
-	cmpl	$FFI_TYPE_STRUCT, %eax
-	je	.Lcls_retstruct
-.Lcls_epilogue:
-	movl	%ebp, %esp
-	popl	%ebp
-	ret
-.Lcls_retint:
-	movl	(%ecx), %eax
-	jmp	.Lcls_epilogue
-.Lcls_retfloat:
-	flds	(%ecx)
-	jmp	.Lcls_epilogue
-.Lcls_retdouble:
-	fldl	(%ecx)
-	jmp	.Lcls_epilogue
-.Lcls_retldouble:
-	fldt	(%ecx)
-	jmp	.Lcls_epilogue
-.Lcls_retllong:
-	movl	(%ecx), %eax
-	movl	4(%ecx), %edx
-	jmp	.Lcls_epilogue
-.Lcls_retstruct1b:
-	movsbl	(%ecx), %eax
-	jmp	.Lcls_epilogue
-.Lcls_retstruct2b:
-	movswl	(%ecx), %eax
-	jmp	.Lcls_epilogue
-.Lcls_retstruct:
-	lea -8(%ebp),%esp
-	movl	%ebp, %esp
-	popl	%ebp
-	ret $4
-.LFE2:
-
-#if !FFI_NO_RAW_API
-
-#define RAW_CLOSURE_CIF_OFFSET ((FFI_TRAMPOLINE_SIZE + 3) & ~3)
-#define RAW_CLOSURE_FUN_OFFSET (RAW_CLOSURE_CIF_OFFSET + 4)
-#define RAW_CLOSURE_USER_DATA_OFFSET (RAW_CLOSURE_FUN_OFFSET + 4)
-#define CIF_FLAGS_OFFSET 20
-
-	.align	4
-FFI_HIDDEN (ffi_closure_raw_SYSV)
-.globl _ffi_closure_raw_SYSV
-
-_ffi_closure_raw_SYSV:
-.LFB3:
-	pushl	%ebp
-.LCFI4:
-	movl	%esp, %ebp
-.LCFI5:
-	pushl	%esi
-.LCFI6:
-	subl	$36, %esp
-	movl	RAW_CLOSURE_CIF_OFFSET(%eax), %esi	 /* closure->cif */
-	movl	RAW_CLOSURE_USER_DATA_OFFSET(%eax), %edx /* closure->user_data */
-	movl	%edx, 12(%esp)	/* user_data */
-	leal	8(%ebp), %edx	/* __builtin_dwarf_cfa () */
-	movl	%edx, 8(%esp)	/* raw_args */
-	leal	-24(%ebp), %edx
-	movl	%edx, 4(%esp)	/* &res */
-	movl	%esi, (%esp)	/* cif */
-	call	*RAW_CLOSURE_FUN_OFFSET(%eax)		 /* closure->fun */
-	movl	CIF_FLAGS_OFFSET(%esi), %eax		 /* rtype */
-	cmpl	$FFI_TYPE_INT, %eax
-	je	.Lrcls_retint
-
-	/* Handle FFI_TYPE_UINT8, FFI_TYPE_SINT8, FFI_TYPE_UINT16,
-	   FFI_TYPE_SINT16, FFI_TYPE_UINT32, FFI_TYPE_SINT32.  */
-	cmpl	$FFI_TYPE_UINT64, %eax
-	jge	0f
-	cmpl	$FFI_TYPE_UINT8, %eax
-	jge	.Lrcls_retint
-0:
-	cmpl	$FFI_TYPE_FLOAT, %eax
-	je	.Lrcls_retfloat
-	cmpl	$FFI_TYPE_DOUBLE, %eax
-	je	.Lrcls_retdouble
-	cmpl	$FFI_TYPE_LONGDOUBLE, %eax
-	je	.Lrcls_retldouble
-	cmpl	$FFI_TYPE_SINT64, %eax
-	je	.Lrcls_retllong
-.Lrcls_epilogue:
-	addl	$36, %esp
-	popl	%esi
-	popl	%ebp
-	ret
-.Lrcls_retint:
-	movl	-24(%ebp), %eax
-	jmp	.Lrcls_epilogue
-.Lrcls_retfloat:
-	flds	-24(%ebp)
-	jmp	.Lrcls_epilogue
-.Lrcls_retdouble:
-	fldl	-24(%ebp)
-	jmp	.Lrcls_epilogue
-.Lrcls_retldouble:
-	fldt	-24(%ebp)
-	jmp	.Lrcls_epilogue
-.Lrcls_retllong:
-	movl	-24(%ebp), %eax
-	movl	-20(%ebp), %edx
-	jmp	.Lrcls_epilogue
-.LFE3:
+#if !defined(POWERPC_DARWIN)
+	/* The TOC slot is reserved in the Darwin ABI and r2 is volatile.  */
+	sg	r2,(5 * GPR_BYTES)(r1)
 #endif
 
-.section __IMPORT,__jump_table,symbol_stubs,self_modifying_code+pure_instructions,5
-L_ffi_closure_SYSV_inner$stub:
-	.indirect_symbol _ffi_closure_SYSV_inner
-	hlt ; hlt ; hlt ; hlt ; hlt
+LCFI1:
 
+	/* Save arguments over call.  */
+	mr	r31,r5	/* flags,  */
+	mr	r30,r6	/* rvalue,  */
+	mr	r29,r7	/* function address,  */
+	mr	r28,r8	/* our AP.  */
+LCFI2:
+	/* Call ffi_prep_args. r3 = extended cif, r4 = stack ptr copy.  */
+	mr	r4,r1
+	li	r9,0
 
-.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+	mtctr	r12 /* r12 holds address of _ffi_prep_args.  */
+	bctrl
+
+#if !defined(POWERPC_DARWIN)
+	/* The TOC slot is reserved in the Darwin ABI and r2 is volatile.  */
+	lg     r2,(5 * GPR_BYTES)(r1)
+#endif
+	/* Now do the call.
+	   Set up cr1 with bits 4-7 of the flags.  */
+	mtcrf	0x40,r31
+	/* Get the address to call into CTR.  */
+	mtctr	r29
+	/* Load all those argument registers.
+	   We have set up a nice stack frame, just load it into registers.  */
+	lg     r3, (LINKAGE_SIZE                )(r1)
+	lg     r4, (LINKAGE_SIZE +     GPR_BYTES)(r1)
+	lg     r5, (LINKAGE_SIZE + 2 * GPR_BYTES)(r1)
+	lg     r6, (LINKAGE_SIZE + 3 * GPR_BYTES)(r1)
+	nop
+	lg     r7, (LINKAGE_SIZE + 4 * GPR_BYTES)(r1)
+	lg     r8, (LINKAGE_SIZE + 5 * GPR_BYTES)(r1)
+	lg     r9, (LINKAGE_SIZE + 6 * GPR_BYTES)(r1)
+	lg     r10,(LINKAGE_SIZE + 7 * GPR_BYTES)(r1)
+
+L1:
+	/* ... Load all the FP registers.  */
+	bf	6,L2	/* No floats to load.  */
+	lfd	f1, -SAVE_REGS_SIZE-(13*FPR_SIZE)(r28)
+	lfd	f2, -SAVE_REGS_SIZE-(12*FPR_SIZE)(r28)
+	lfd	f3, -SAVE_REGS_SIZE-(11*FPR_SIZE)(r28)
+	lfd	f4, -SAVE_REGS_SIZE-(10*FPR_SIZE)(r28)
+	nop
+	lfd	f5, -SAVE_REGS_SIZE-( 9*FPR_SIZE)(r28)
+	lfd	f6, -SAVE_REGS_SIZE-( 8*FPR_SIZE)(r28)
+	lfd	f7, -SAVE_REGS_SIZE-( 7*FPR_SIZE)(r28)
+	lfd	f8, -SAVE_REGS_SIZE-( 6*FPR_SIZE)(r28)
+	nop
+	lfd     f9, -SAVE_REGS_SIZE-( 5*FPR_SIZE)(r28)
+	lfd     f10,-SAVE_REGS_SIZE-( 4*FPR_SIZE)(r28)
+	lfd     f11,-SAVE_REGS_SIZE-( 3*FPR_SIZE)(r28)
+	lfd     f12,-SAVE_REGS_SIZE-( 2*FPR_SIZE)(r28)
+	nop
+	lfd     f13,-SAVE_REGS_SIZE-( 1*FPR_SIZE)(r28)
+
+L2:
+	mr	r12,r29	/* Put the target address in r12 as specified.  */
+	mtctr  	r12
+	nop
+	nop
+
+	/* Make the call.  */
+	bctrl
+
+	/* Now, deal with the return value.  */
+
+	/* m64 structure returns can occupy the same set of registers as
+	   would be used to pass such a structure as arg0 - so take care 
+	   not to step on any possibly hot regs.  */
+
+	/* Get the flags.. */
+	mtcrf	0x03,r31 ; we need c6 & cr7 now.
+	; FLAG_RETURNS_NOTHING also covers struct ret-by-ref.
+	bt	30,L(done_return_value)	  ; FLAG_RETURNS_NOTHING
+	bf	27,L(scalar_return_value) ; not FLAG_RETURNS_STRUCT
+	
+	/* OK, so we have a struct.  */
+#if defined(__ppc64__)
+	bt	31,L(maybe_return_128) ; FLAG_RETURNS_128BITS, special case 
+
+	/* OK, we have to map the return back to a mem struct.
+	   We are about to trample the parents param area, so recover the
+	   return type.  r29 is free, since the call is done.  */
+	lg	r29,(LINKAGE_SIZE + 6 * GPR_BYTES)(r28)
+
+	sg	r3, (LINKAGE_SIZE                )(r28)
+	sg	r4, (LINKAGE_SIZE +     GPR_BYTES)(r28)
+	sg	r5, (LINKAGE_SIZE + 2 * GPR_BYTES)(r28)
+	sg	r6, (LINKAGE_SIZE + 3 * GPR_BYTES)(r28)
+	nop
+	sg	r7, (LINKAGE_SIZE + 4 * GPR_BYTES)(r28)
+	sg	r8, (LINKAGE_SIZE + 5 * GPR_BYTES)(r28)
+	sg	r9, (LINKAGE_SIZE + 6 * GPR_BYTES)(r28)
+	sg	r10,(LINKAGE_SIZE + 7 * GPR_BYTES)(r28)
+	/* OK, so do the block move - we trust that memcpy will not trample
+	   the fprs...  */
+	mr 	r3,r30 ; dest
+	addi	r4,r28,LINKAGE_SIZE ; source
+	/* The size is a size_t, should be long.  */
+	lg	r5,0(r29)
+	/* Figure out small structs */
+	cmpi	0,r5,4
+	bgt	L3	; 1, 2 and 4 bytes have special rules.
+	cmpi	0,r5,3
+	beq	L3	; not 3
+	addi	r4,r4,8
+	subf	r4,r5,r4
+L3:
+	bl	_memcpy
+	
+	/* ... do we need the FP registers? - recover the flags.. */
+	mtcrf	0x03,r31 ; we need c6 & cr7 now.
+	bf	29,L(done_return_value)	/* No floats in the struct.  */
+	stfd	f1, -SAVE_REGS_SIZE-(13*FPR_SIZE)(r28)
+	stfd	f2, -SAVE_REGS_SIZE-(12*FPR_SIZE)(r28)
+	stfd	f3, -SAVE_REGS_SIZE-(11*FPR_SIZE)(r28)
+	stfd	f4, -SAVE_REGS_SIZE-(10*FPR_SIZE)(r28)
+	nop
+	stfd	f5, -SAVE_REGS_SIZE-( 9*FPR_SIZE)(r28)
+	stfd	f6, -SAVE_REGS_SIZE-( 8*FPR_SIZE)(r28)
+	stfd	f7, -SAVE_REGS_SIZE-( 7*FPR_SIZE)(r28)
+	stfd	f8, -SAVE_REGS_SIZE-( 6*FPR_SIZE)(r28)
+	nop
+	stfd	f9, -SAVE_REGS_SIZE-( 5*FPR_SIZE)(r28)
+	stfd	f10,-SAVE_REGS_SIZE-( 4*FPR_SIZE)(r28)
+	stfd	f11,-SAVE_REGS_SIZE-( 3*FPR_SIZE)(r28)
+	stfd	f12,-SAVE_REGS_SIZE-( 2*FPR_SIZE)(r28)
+	nop
+	stfd	f13,-SAVE_REGS_SIZE-( 1*FPR_SIZE)(r28)
+
+	mr	r3,r29	; ffi_type *
+	mr	r4,r30	; dest
+	addi	r5,r28,-SAVE_REGS_SIZE-(13*FPR_SIZE) ; fprs
+	xor	r6,r6,r6
+	sg	r6,(LINKAGE_SIZE + 7 * GPR_BYTES)(r28)
+	addi	r6,r28,(LINKAGE_SIZE + 7 * GPR_BYTES) ; point to a zeroed counter.
+	bl 	_darwin64_struct_floats_to_mem
+
+	b L(done_return_value)
+#else
+	stw	r3,0(r30) ; m32 the only struct return in reg is 4 bytes.
+#endif
+	b L(done_return_value)
+
+L(fp_return_value):
+	/* Do we have long double to store?  */
+	bf	31,L(fd_return_value) ; FLAG_RETURNS_128BITS
+	stfd	f1,0(r30)
+	stfd	f2,FPR_SIZE(r30)
+	b	L(done_return_value)
+
+L(fd_return_value):
+	/* Do we have double to store?  */
+	bf	28,L(float_return_value)
+	stfd	f1,0(r30)
+	b	L(done_return_value)
+
+L(float_return_value):
+	/* We only have a float to store.  */
+	stfs	f1,0(r30)
+	b	L(done_return_value)
+
+L(scalar_return_value):
+	bt	29,L(fp_return_value)	; FLAG_RETURNS_FP
+	; ffi_arg is defined as unsigned long. 
+	sg	r3,0(r30)		; Save the reg.
+	bf	28,L(done_return_value) ; not FLAG_RETURNS_64BITS 
+
+#if defined(__ppc64__)
+L(maybe_return_128):
+	std	r3,0(r30)
+	bf	31,L(done_return_value) ; not FLAG_RETURNS_128BITS 
+	std	r4,8(r30)
+#else
+	stw	r4,4(r30)
+#endif
+
+	/* Fall through.  */
+	/* We want this at the end to simplify eh epilog computation.  */
+
+L(done_return_value):
+	/* Restore the registers we used and return.  */
+	lg	r29,SAVED_LR_OFFSET(r28)
+	; epilog
+	lg	r31,-(1 * GPR_BYTES)(r28)
+	mtlr	r29
+	lg	r30,-(2 * GPR_BYTES)(r28)
+	lg	r29,-(3 * GPR_BYTES)(r28)
+	lg	r28,-(4 * GPR_BYTES)(r28)
+	lg	r1,0(r1)
+	blr
+LFE1:
+	.align	1
+/* END(_ffi_call_DARWIN)  */
+
+/* Provide a null definition of _ffi_call_AIX.  */
+	.text
+	.globl _ffi_call_AIX
+	.align 2
+_ffi_call_AIX:
+	blr
+/* END(_ffi_call_AIX)  */
+
+/* EH stuff.  */
+
+#define EH_DATA_ALIGN_FACT MODE_CHOICE(0x7c,0x78)
+
+	.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
 EH_frame1:
 	.set	L$set$0,LECIE1-LSCIE1
-	.long	L$set$0
+	.long	L$set$0	; Length of Common Information Entry
 LSCIE1:
-	.long	0x0
-	.byte	0x1
-	.ascii "zR\0"
-	.byte	0x1
-	.byte	0x7c
-	.byte	0x8
-	.byte	0x1
-	.byte	0x10
-	.byte	0xc
-	.byte	0x5
-	.byte	0x4
-	.byte	0x88
-	.byte	0x1
-	.align 2
+	.long	0x0	; CIE Identifier Tag
+	.byte	0x1	; CIE Version
+	.ascii	"zR\0"	; CIE Augmentation
+	.byte	0x1	; uleb128 0x1; CIE Code Alignment Factor
+	.byte	EH_DATA_ALIGN_FACT ; sleb128 -4; CIE Data Alignment Factor
+	.byte	0x41	; CIE RA Column
+	.byte	0x1	; uleb128 0x1; Augmentation size
+	.byte	0x10	; FDE Encoding (pcrel)
+	.byte	0xc	; DW_CFA_def_cfa
+	.byte	0x1	; uleb128 0x1
+	.byte	0x0	; uleb128 0x0
+	.align	LOG2_GPR_BYTES
 LECIE1:
-.globl _ffi_call_SYSV.eh
-_ffi_call_SYSV.eh:
+
+	.globl _ffi_call_DARWIN.eh
+_ffi_call_DARWIN.eh:
 LSFDE1:
 	.set	L$set$1,LEFDE1-LASFDE1
-	.long	L$set$1
+	.long	L$set$1	; FDE Length
 LASFDE1:
-	.long	LASFDE1-EH_frame1
-	.long	.LFB1-.
-	.set L$set$2,.LFE1-.LFB1
-	.long L$set$2
-	.byte	0x0
-	.byte	0x4
-	.set L$set$3,.LCFI0-.LFB1
-	.long L$set$3
-	.byte	0xe
-	.byte	0x8
-	.byte	0x84
-	.byte	0x2
-	.byte	0x4
-	.set L$set$4,.LCFI1-.LCFI0
-	.long L$set$4
-	.byte	0xd
-	.byte	0x4
-	.align 2
-LEFDE1:
-.globl _ffi_closure_SYSV.eh
-_ffi_closure_SYSV.eh:
-LSFDE2:
-	.set	L$set$5,LEFDE2-LASFDE2
+	.long	LASFDE1-EH_frame1 ; FDE CIE offset
+	.g_long	Lstartcode-.	; FDE initial location
+	.set	L$set$3,LFE1-Lstartcode
+	.g_long	L$set$3	; FDE address range
+	.byte   0x0     ; uleb128 0x0; Augmentation size
+	.byte	0x4	; DW_CFA_advance_loc4
+	.set	L$set$4,LCFI0-Lstartcode
+	.long	L$set$4
+	.byte	0xd	; DW_CFA_def_cfa_register
+	.byte	0x08	; uleb128 0x08
+	.byte	0x4	; DW_CFA_advance_loc4
+	.set	L$set$5,LCFI1-LCFI0
 	.long	L$set$5
-LASFDE2:
-	.long	LASFDE2-EH_frame1
-	.long	.LFB2-.
-	.set L$set$6,.LFE2-.LFB2
-	.long L$set$6
-	.byte	0x0
-	.byte	0x4
-	.set L$set$7,.LCFI2-.LFB2
-	.long L$set$7
-	.byte	0xe
-	.byte	0x8
-	.byte	0x84
-	.byte	0x2
-	.byte	0x4
-	.set L$set$8,.LCFI3-.LCFI2
-	.long L$set$8
-	.byte	0xd
-	.byte	0x4
-	.align 2
-LEFDE2:
+	.byte   0x11    ; DW_CFA_offset_extended_sf
+	.byte	0x41	; uleb128 0x41
+	.byte   0x7e    ; sleb128 -2
+	.byte	0x9f	; DW_CFA_offset, column 0x1f
+	.byte	0x1	; uleb128 0x1
+	.byte	0x9e	; DW_CFA_offset, column 0x1e
+	.byte	0x2	; uleb128 0x2
+	.byte	0x9d	; DW_CFA_offset, column 0x1d
+	.byte	0x3	; uleb128 0x3
+	.byte	0x9c	; DW_CFA_offset, column 0x1c
+	.byte	0x4	; uleb128 0x4
+	.byte	0x4	; DW_CFA_advance_loc4
+	.set	L$set$6,LCFI2-LCFI1
+	.long	L$set$6
+	.byte	0xd	; DW_CFA_def_cfa_register
+	.byte	0x1c	; uleb128 0x1c
+	.align LOG2_GPR_BYTES
+LEFDE1:
+	.align 1
 
-#if !FFI_NO_RAW_API
-
-.globl _ffi_closure_raw_SYSV.eh
-_ffi_closure_raw_SYSV.eh:
-LSFDE3:
-	.set	L$set$10,LEFDE3-LASFDE3
-	.long	L$set$10
-LASFDE3:
-	.long	LASFDE3-EH_frame1
-	.long	.LFB3-.
-	.set L$set$11,.LFE3-.LFB3
-	.long L$set$11
-	.byte	0x0
-	.byte	0x4
-	.set L$set$12,.LCFI4-.LFB3
-	.long L$set$12
-	.byte	0xe
-	.byte	0x8
-	.byte	0x84
-	.byte	0x2
-	.byte	0x4
-	.set L$set$13,.LCFI5-.LCFI4
-	.long L$set$13
-	.byte	0xd
-	.byte	0x4
-	.byte	0x4
-	.set L$set$14,.LCFI6-.LCFI5
-	.long L$set$14
-	.byte	0x85
-	.byte	0x3
-	.align 2
-LEFDE3:
-
-#endif
-
-#endif /* ifndef __x86_64__ */

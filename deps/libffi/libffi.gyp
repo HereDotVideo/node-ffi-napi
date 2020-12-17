@@ -138,8 +138,7 @@
           'conditions': [
             ['OS=="mac"', {
               'sources': [
-                'src/x86/darwin.S',
-                'src/x86/darwin64.S'
+                'src/x86/unix64.S',
               ]
             }],
             ['OS=="win"', {
